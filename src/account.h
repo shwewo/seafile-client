@@ -29,6 +29,14 @@ public:
     bool isAutomaticLogin;
     QString s2fa_token;
 
+    // Mutual TLS: client certificate presented to this account's server.
+    QString clientSslCertPath;
+    QString clientSslKeyPath;
+    QString clientSslCertType;     // "PEM" (default) or "P12"
+    QString clientSslCertPassword;
+
+    bool hasClientSslCert() const { return !clientSslCertPath.isEmpty(); }
+
     Account() : serverInfo(),
                 lastVisited(0),
                 isShibboleth(false),
@@ -55,7 +63,11 @@ public:
         lastVisited(rhs.lastVisited),
         isShibboleth(rhs.isShibboleth),
         isAutomaticLogin(rhs.isAutomaticLogin),
-        s2fa_token(rhs.s2fa_token)
+        s2fa_token(rhs.s2fa_token),
+        clientSslCertPath(rhs.clientSslCertPath),
+        clientSslKeyPath(rhs.clientSslKeyPath),
+        clientSslCertType(rhs.clientSslCertType),
+        clientSslCertPassword(rhs.clientSslCertPassword)
     {
     }
 
@@ -69,6 +81,10 @@ public:
         isShibboleth = rhs.isShibboleth;
         isAutomaticLogin = rhs.isAutomaticLogin;
         s2fa_token = rhs.s2fa_token;
+        clientSslCertPath = rhs.clientSslCertPath;
+        clientSslKeyPath = rhs.clientSslKeyPath;
+        clientSslCertType = rhs.clientSslCertType;
+        clientSslCertPassword = rhs.clientSslCertPassword;
         return *this;
     }
 

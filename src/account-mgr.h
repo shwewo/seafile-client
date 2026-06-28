@@ -122,6 +122,9 @@ private:
     Q_DISABLE_COPY(AccountManager)
 
     void updateAccountServerInfo(const Account& account);
+    // Register every account's mutual-TLS client certificate with the api/SSO
+    // layer and publish the per-host map for seaf-daemon.
+    void syncClientSslCerts();
     static bool loadAccountsCB(struct sqlite3_stmt *stmt, void *data);
     static bool loadServerInfoCB(struct sqlite3_stmt *stmt, void *data);
 

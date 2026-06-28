@@ -41,6 +41,15 @@ OPTION(BUILD_TESTING "Build Test" OFF)
 OPTION(BUILD_DOCS "Build Documents" OFF)
 
 OPTION(BUILD_SHIBBOLETH_SUPPORT "Build Shibboleth support" OFF)
+OPTION(BUILD_CLIENT_SSO_SUPPORT "Build SSO login (browser-based; no embedded webview)" OFF)
+
+IF (BUILD_SHIBBOLETH_SUPPORT)
+    SET(BUILD_CLIENT_SSO_SUPPORT ON)
+ENDIF()
+
+IF (BUILD_CLIENT_SSO_SUPPORT)
+    ADD_DEFINITIONS(-DHAVE_CLIENT_SSO_SUPPORT)
+ENDIF()
 
 option(BUILD_ENABLE_WARNINGS "Enable compiler warnings." ON)
 
@@ -419,6 +428,7 @@ SET(seafile_client_sources
   src/certs-mgr.cpp
   src/log-uploader.cpp
   src/sync-error-service.cpp
+  src/utils/mtls.cpp
   src/api/api-client.cpp
   src/api/api-request.cpp
   src/api/api-error.cpp

@@ -7,11 +7,18 @@
 #include <QDateTime>
 #include <QMutexLocker>
 #include <QStringList>
+#include <QDir>
+#include <QFile>
+#include <QUrl>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QCryptographicHash>
 
 #include "account-mgr.h"
 #include "configurator.h"
 #include "seafile-applet.h"
 #include "utils/utils.h"
+#include "utils/mtls.h"
 #include "api/api-error.h"
 #include "api/requests.h"
 #include "rpc/rpc-client.h"
@@ -33,6 +40,16 @@ const char *kUsedStorage = "storage.used";
 const char *kNickname = "name";
 const char *kEmail = "email";
 const char *kContactEmail = "contact_email";
+
+// Per-account mutual-TLS client certificate, stored in the ServerInfo table.
+const char *kClientSslCertPath = "client_ssl_cert_path";
+const char *kClientSslKeyPath = "client_ssl_key_path";
+const char *kClientSslCertType = "client_ssl_cert_type";
+const char *kClientSslCertPassword = "client_ssl_cert_password";
+
+// File in the seafile data dir that seaf-daemon reads to learn the per-host
+// client certificates (mirrors the system-proxy.txt mechanism).
+const char *kClientSslCertsFile = "client-ssl-certs.json";
 
 struct ColumnCheckData {
     QString name;
@@ -95,6 +112,65 @@ inline void setServerInfoKeyValue(struct sqlite3 *db, const Account &account, co
         key.toUtf8().data(), value.toUtf8().data());
     sqlite_query_exec(db, zql);
     sqlite3_free(zql);
+}
+
+const char *kClientCertsSubdir = "client-certs";
+
+// Copy an account's externally-selected certificate (and key) into Seafile's
+// own data dir so it is managed internally and the original file can move or be
+// deleted. Rewrites the account's paths to the internal copies. No-op if the
+// certificate already lives in internal storage.
+void importClientSslCert(Account *account)
+{
+    if (account->clientSslCertPath.isEmpty())
+        return;
+
+    QString base = QDir(seafApplet->configurator()->seafileDir())
+                       .filePath(kClientCertsSubdir);
+    QDir().mkpath(base);
+    // Best-effort: restrict the directory to the owner (POSIX; limited on Win).
+    QFile::setPermissions(base, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+
+    if (account->clientSslCertPath.startsWith(base)) {
+        return;     // already imported
+    }
+
+    QByteArray sig = QCryptographicHash::hash(
+        (account->serverUrl.host() + "/" + account->username).toUtf8(),
+        QCryptographicHash::Sha1).toHex();
+    QString stem = QDir(base).filePath(QString::fromLatin1(sig));
+
+    bool is_p12 = account->clientSslCertType.compare("P12", Qt::CaseInsensitive) == 0;
+    QString cert_dest = stem + (is_p12 ? ".p12" : ".pem");
+
+    QFile::remove(cert_dest);
+    if (QFile::copy(account->clientSslCertPath, cert_dest)) {
+        QFile::setPermissions(cert_dest, QFile::ReadOwner | QFile::WriteOwner);
+        account->clientSslCertPath = cert_dest;
+    } else {
+        qWarning("[mtls] failed to import certificate %s into internal storage",
+                 account->clientSslCertPath.toUtf8().constData());
+        return;
+    }
+
+    if (!account->clientSslKeyPath.isEmpty() &&
+        !account->clientSslKeyPath.startsWith(base)) {
+        QString key_dest = stem + ".key";
+        QFile::remove(key_dest);
+        if (QFile::copy(account->clientSslKeyPath, key_dest)) {
+            QFile::setPermissions(key_dest, QFile::ReadOwner | QFile::WriteOwner);
+            account->clientSslKeyPath = key_dest;
+        }
+    }
+}
+
+// Persist an account's mutual-TLS client certificate into the ServerInfo table.
+void saveAccountClientSslCert(struct sqlite3 *db, const Account &account)
+{
+    setServerInfoKeyValue(db, account, kClientSslCertPath, account.clientSslCertPath);
+    setServerInfoKeyValue(db, account, kClientSslKeyPath, account.clientSslKeyPath);
+    setServerInfoKeyValue(db, account, kClientSslCertType, account.clientSslCertType);
+    setServerInfoKeyValue(db, account, kClientSslCertPassword, account.clientSslCertPassword);
 }
 
 }
@@ -166,6 +242,10 @@ int AccountManager::start()
 
     loadAccounts();
 
+    // Register each saved account's client certificate and publish the map for
+    // seaf-daemon.
+    syncClientSslCerts();
+
     connect(this, SIGNAL(accountsChanged()), this, SLOT(onAccountsChanged()));
     connect(qApp, SIGNAL(aboutToQuit()), this, SLOT(onAboutToQuit()));
     connect(this, SIGNAL(accountRequireRelogin(const Account&)),
@@ -235,6 +315,14 @@ bool AccountManager::loadServerInfoCB(sqlite3_stmt *stmt, void *data)
         account->accountInfo.email = value_string;
     } else if (key_string == kContactEmail) {
         account->accountInfo.contact_email = value_string;
+    } else if (key_string == kClientSslCertPath) {
+        account->clientSslCertPath = value_string;
+    } else if (key_string == kClientSslKeyPath) {
+        account->clientSslKeyPath = value_string;
+    } else if (key_string == kClientSslCertType) {
+        account->clientSslCertType = value_string;
+    } else if (key_string == kClientSslCertPassword) {
+        account->clientSslCertPassword = value_string;
     }
     return true;
 }
@@ -260,6 +348,23 @@ void AccountManager::setCurrentAccount(const Account& account)
     emit beforeAccountSwitched();
 
     Account new_account = account;
+
+    // If the account carries no certificate of its own but one was registered
+    // for its host during login (covers normal, client-SSO and Shibboleth
+    // flows), adopt it so it gets persisted with the account.
+    if (new_account.clientSslCertPath.isEmpty()) {
+        mtls::CertConfig cfg;
+        if (mtls::hostCert(new_account.serverUrl.host(), &cfg)) {
+            new_account.clientSslCertPath = cfg.certPath;
+            new_account.clientSslKeyPath = cfg.keyPath;
+            new_account.clientSslCertType = cfg.certType;
+            new_account.clientSslCertPassword = cfg.password;
+        }
+    }
+
+    // Import the certificate into Seafile's own storage (rewrites its paths).
+    importClientSslCert(&new_account);
+
     bool account_exist = false;
     {
         QMutexLocker lock(&accounts_mutex_);
@@ -319,6 +424,11 @@ void AccountManager::setCurrentAccount(const Account& account)
     sqlite_query_exec(db, zql);
     sqlite3_free(zql);
 
+    // Persist the per-account client certificate (the Accounts row now exists,
+    // satisfying the ServerInfo foreign key) and refresh the per-host map.
+    saveAccountClientSslCert(db, new_account);
+    syncClientSslCerts();
+
     emit accountsChanged();
 }
 
@@ -350,6 +460,9 @@ int AccountManager::removeAccount(const Account& account)
             login_dialog.exec();
         }
     }
+
+    // The removed account's certificate must no longer be advertised.
+    syncClientSslCerts();
 
     emit accountsChanged();
 
@@ -493,6 +606,51 @@ void AccountManager::updateServerInfoForAllAccounts()
 {
     for (size_t i = 0; i < accounts_.size(); i++)
         updateAccountServerInfo(accounts_[i]);
+}
+
+void AccountManager::syncClientSslCerts()
+{
+    QJsonObject root;
+
+    {
+        QMutexLocker lock(&accounts_mutex_);
+        for (const Account& account : accounts_) {
+            QString host = account.serverUrl.host();
+            mtls::CertConfig cfg;
+            cfg.certPath = account.clientSslCertPath;
+            cfg.keyPath = account.clientSslKeyPath;
+            cfg.certType = account.clientSslCertType.isEmpty()
+                               ? QString("PEM") : account.clientSslCertType;
+            cfg.password = account.clientSslCertPassword;
+
+            // Register for the GUI's own api/login/SSO requests (empty config
+            // clears any stale registration for this host).
+            mtls::setHostCert(host, cfg);
+
+            if (!cfg.isEmpty()) {
+                QJsonObject entry;
+                entry["cert_path"] = cfg.certPath;
+                entry["key_path"] = cfg.keyPath;
+                entry["cert_type"] = cfg.certType;
+                entry["cert_password"] = cfg.password;
+                root[host.toLower()] = entry;
+            }
+        }
+    }
+
+    // Publish the per-host certificate map for seaf-daemon to read (file sync).
+    QString path = QDir(seafApplet->configurator()->seafileDir())
+                       .filePath(kClientSslCertsFile);
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        f.close();
+        // Best-effort: the file holds certificate passwords, so keep it private
+        // (POSIX 0600; on platforms without owner-only perms this is a no-op).
+        f.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+    } else {
+        qWarning("[mtls] failed to write %s", path.toUtf8().constData());
+    }
 }
 
 void AccountManager::updateAccountServerInfo(const Account& account)

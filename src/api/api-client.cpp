@@ -11,6 +11,7 @@
 #include "ui/main-window.h"
 #include "ui/ssl-confirm-dialog.h"
 #include "utils/utils.h"
+#include "utils/mtls.h"
 #include "network-mgr.h"
 #include "server-status-service.h"
 
@@ -80,6 +81,13 @@ SeafileApiClient::~SeafileApiClient()
 
 void SeafileApiClient::prepareRequest(QNetworkRequest *req)
 {
+    // Mutual TLS: present the client certificate (if configured) so login/SSO
+    // and other api2 requests can authenticate against an mTLS-protected server.
+    QSslConfiguration ssl_config;
+    if (mtls::configurationForUrl(req->url(), &ssl_config)) {
+        req->setSslConfiguration(ssl_config);
+    }
+
     if (use_cache_) {
         req->setAttribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::PreferNetwork);
         req->setAttribute(QNetworkRequest::CacheSaveControlAttribute, true);

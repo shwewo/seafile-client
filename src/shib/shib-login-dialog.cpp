@@ -6,17 +6,24 @@
   #include <QWebEnginePage>
   #include <QWebEngineProfile>
   #include <QWebEngineCookieStore>
+  #if QT_VERSION >= QT_VERSION_CHECK(5, 13, 0)
+    #include <QWebEngineClientCertificateStore>
+    #include <QWebEngineClientCertificateSelection>
+  #endif
   #include "shib-helper.h"
 #endif
 #include <QVBoxLayout>
 #include <QList>
 #include <QLineEdit>
 #include <QSslError>
+#include <QSslKey>
+#include <QSslCertificate>
 #include <QNetworkReply>
 #include <QNetworkCookie>
 
 #include "seafile-applet.h"
 #include "utils/utils.h"
+#include "utils/mtls.h"
 #include "utils/api-utils.h"
 #include "account-mgr.h"
 #include "network-mgr.h"
@@ -76,6 +83,25 @@ ShibLoginDialog::ShibLoginDialog(const QUrl& url,
     QWebEngineCookieStore *jar = webview_->page()->profile()->cookieStore();
     connect(jar, SIGNAL(cookieAdded(const QNetworkCookie&)),
             this, SLOT(onWebEngineCookieAdded(const QNetworkCookie&)));
+
+#if QT_VERSION >= QT_VERSION_CHECK(5, 13, 0)
+    // Mutual TLS: make the configured client certificate available to the SSO
+    // web view and auto-select it when the IdP requests a client certificate.
+    if (mtls::hasCertForUrl(url_)) {
+        QSslCertificate cert;
+        QSslKey key;
+        if (mtls::certAndKeyForUrl(url_, &cert, &key)) {
+            web_engine_profile_->clientCertificateStore()->add(cert, key);
+            connect(web_engine_page_, &QWebEnginePage::selectClientCertificate,
+                    this, [](QWebEngineClientCertificateSelection selection) {
+                        const QList<QSslCertificate> certs = selection.certificates();
+                        if (!certs.isEmpty()) {
+                            selection.select(certs.first());
+                        }
+                    });
+        }
+    }
+#endif
 #endif
 
     QUrl shib_login_url(url_);

@@ -41,9 +41,9 @@ const char *kComputerName = "computerName";
 #ifdef HAVE_FINDER_SYNC_SUPPORT
 const char *kFinderSync = "finderSync";
 #endif // HAVE_FINDER_SYNC_SUPPORT
-#ifdef HAVE_SHIBBOLETH_SUPPORT
+#ifdef HAVE_CLIENT_SSO_SUPPORT
 const char *kLastShibUrl = "lastShiburl";
-#endif // HAVE_SHIBBOLETH_SUPPORT
+#endif // HAVE_CLIENT_SSO_SUPPORT
 
 #if defined(Q_OS_LINUX) || defined(Q_OS_MAC)
 const char * kSetHideWindowsIncompatibilityPathMsg = "setHideWindowsIncompatibilityPathMsg";
@@ -652,7 +652,7 @@ int SettingsManager::repoSortOrder() const
     return repo_sort_orders_;
 }
 
-#ifdef HAVE_SHIBBOLETH_SUPPORT
+#ifdef HAVE_CLIENT_SSO_SUPPORT
 QString SettingsManager::getLastShibUrl()
 {
     QSettings settings;
@@ -672,7 +672,7 @@ void SettingsManager::setLastShibUrl(const QString &url)
     settings.setValue(kLastShibUrl, url);
     settings.endGroup();
 }
-#endif // HAVE_SHIBBOLETH_SUPPORT
+#endif // HAVE_CLIENT_SSO_SUPPORT
 
 #ifdef HAVE_FINDER_SYNC_SUPPORT
 bool SettingsManager::getFinderSyncExtension() const

@@ -13,6 +13,7 @@
 #include "api/requests.h"
 #include "login-dialog.h"
 #include "utils/utils.h"
+#include "utils/mtls.h"
 #ifdef HAVE_SHIBBOLETH_SUPPORT
 #include "shib/shib-login-dialog.h"
 #endif // HAVE_SHIBBOLETH_SUPPORT
@@ -23,7 +24,7 @@ const char *kUsedServerAddresses = "UsedServerAddresses";
 const char *const kPreconfigureServerAddr = "PreconfigureServerAddr";
 const char *const kPreconfigureServerAddrOnly = "PreconfigureServerAddrOnly";
 
-#ifdef HAVE_SHIBBOLETH_SUPPORT
+#ifdef HAVE_CLIENT_SSO_SUPPORT
 const char *const kPreconfigureShibbolethLoginUrl = "PreconfigureShibbolethLoginUrl";
 #endif
 
@@ -77,8 +78,10 @@ LoginDialog::LoginDialog(QWidget *parent) : QDialog(parent)
     request_ = NULL;
     account_info_req_ = NULL;
     is_remember_device_ = false;
+#ifdef HAVE_CLIENT_SSO_SUPPORT
     connect(&client_sso_timer_, SIGNAL(timeout()),
             this, SLOT(checkClientSSOStatus()));
+#endif
 
     mStatusText->setText("");
     mLogo->setPixmap(QPixmap(":/images/seafile-32.png"));
@@ -100,23 +103,150 @@ LoginDialog::LoginDialog(QWidget *parent) : QDialog(parent)
 
     connect(mSubmitBtn, SIGNAL(clicked()), this, SLOT(doLogin()));
 
+    setupMtlsSection();
+
     const QRect screen = getScreenSize(0);
     move(screen.center() - this->rect().center());
 
-#ifdef HAVE_SHIBBOLETH_SUPPORT
+#ifdef HAVE_CLIENT_SSO_SUPPORT
     setupShibLoginLink();
 #else
     mSSOBtn->hide();
 #endif
 }
 
-#ifdef HAVE_SHIBBOLETH_SUPPORT
+#ifdef HAVE_CLIENT_SSO_SUPPORT
 void LoginDialog::setupShibLoginLink()
 {
     connect(mSSOBtn, SIGNAL(clicked()),
             this, SLOT(loginWithShib()));
 }
-#endif // HAVE_SHIBBOLETH_SUPPORT
+#endif // HAVE_CLIENT_SSO_SUPPORT
+
+// Build a "[line edit] [...]" container so it can be shown/hidden as one item.
+static QWidget *makeBrowseRow(QLineEdit **edit_out, QPushButton **btn_out,
+                              const QString& placeholder)
+{
+    QWidget *row = new QWidget;
+    QHBoxLayout *h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    h->setSpacing(4);
+    QLineEdit *edit = new QLineEdit;
+    edit->setPlaceholderText(placeholder);
+    QPushButton *btn = new QPushButton(QObject::tr("..."));
+    btn->setMaximumWidth(32);
+    h->addWidget(edit);
+    h->addWidget(btn);
+    *edit_out = edit;
+    *btn_out = btn;
+    return row;
+}
+
+void LoginDialog::setupMtlsSection()
+{
+    // Add the certificate controls as extra rows of the existing login form
+    // grid, so they line up (and stay centered) with the other fields.
+    int r = gridLayout->rowCount();
+
+    mtls_enable_ = new QCheckBox(tr("Use a client certificate (mutual TLS)"));
+    gridLayout->addWidget(mtls_enable_, r++, 1, 1, 1);
+
+    QPushButton *cert_btn = nullptr;
+    QPushButton *key_btn = nullptr;
+
+    mtls_cert_label_ = new QLabel(tr("Certificate:"));
+    mtls_cert_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    mtls_cert_row_ = makeBrowseRow(&mtls_cert_, &cert_btn, tr("PEM or .p12 file"));
+    gridLayout->addWidget(mtls_cert_label_, r, 0);
+    gridLayout->addWidget(mtls_cert_row_, r, 1);
+    r++;
+
+    mtls_key_label_ = new QLabel(tr("Key:"));
+    mtls_key_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    mtls_key_row_ = makeBrowseRow(&mtls_key_, &key_btn, tr("PEM key (if separate)"));
+    gridLayout->addWidget(mtls_key_label_, r, 0);
+    gridLayout->addWidget(mtls_key_row_, r, 1);
+    r++;
+
+    mtls_password_label_ = new QLabel(tr("Password:"));
+    mtls_password_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    mtls_password_ = new QLineEdit;
+    mtls_password_->setEchoMode(QLineEdit::Password);
+    mtls_password_->setPlaceholderText(tr("optional"));
+    mtls_password_row_ = mtls_password_;
+    gridLayout->addWidget(mtls_password_label_, r, 0);
+    gridLayout->addWidget(mtls_password_, r, 1);
+    r++;
+
+    connect(cert_btn, SIGNAL(clicked()), this, SLOT(browseClientCert()));
+    connect(key_btn, SIGNAL(clicked()), this, SLOT(browseClientKey()));
+    connect(mtls_enable_, &QCheckBox::toggled, this, [this](bool) {
+        updateMtlsKeyRow();
+    });
+
+    updateMtlsKeyRow();   // collapsed (unchecked) by default
+}
+
+QString LoginDialog::detectedCertType() const
+{
+    QString path = mtls_cert_->text().trimmed();
+    if (path.endsWith(".p12", Qt::CaseInsensitive) ||
+        path.endsWith(".pfx", Qt::CaseInsensitive)) {
+        return "P12";
+    }
+    return "PEM";
+}
+
+void LoginDialog::updateMtlsKeyRow()
+{
+    bool on = mtls_enable_->isChecked();
+    // A PKCS#12 bundle already contains the key, so the key row is PEM-only.
+    bool is_pem = detectedCertType() != "P12";
+
+    mtls_cert_label_->setVisible(on);
+    mtls_cert_row_->setVisible(on);
+    mtls_key_label_->setVisible(on && is_pem);
+    mtls_key_row_->setVisible(on && is_pem);
+    mtls_password_label_->setVisible(on);
+    mtls_password_->setVisible(on);
+
+    adjustSize();
+}
+
+void LoginDialog::browseClientCert()
+{
+    QString path = QFileDialog::getOpenFileName(
+        this, tr("Select client certificate"), mtls_cert_->text(),
+        tr("Certificates (*.p12 *.pfx *.pem *.crt *.cer);;All files (*)"));
+    if (!path.isEmpty()) {
+        mtls_cert_->setText(path);
+        updateMtlsKeyRow();
+    }
+}
+
+void LoginDialog::browseClientKey()
+{
+    QString path = QFileDialog::getOpenFileName(
+        this, tr("Select private key"), mtls_key_->text(),
+        tr("Private keys (*.pem *.key);;All files (*)"));
+    if (!path.isEmpty()) {
+        mtls_key_->setText(path);
+    }
+}
+
+void LoginDialog::applyMtlsForLogin(const QUrl& server_url)
+{
+    if (mtls_enable_->isChecked() && !mtls_cert_->text().trimmed().isEmpty()) {
+        mtls::CertConfig cfg;
+        cfg.certPath = mtls_cert_->text().trimmed();
+        cfg.keyPath = mtls_key_->text().trimmed();
+        cfg.certType = detectedCertType();
+        cfg.password = mtls_password_->text();
+        mtls::setHostCert(server_url.host(), cfg);
+    } else {
+        mtls::removeHostCert(server_url.host());
+    }
+}
 
 void LoginDialog::initFromAccount(const Account& account)
 {
@@ -130,6 +260,14 @@ void LoginDialog::initFromAccount(const Account& account)
     mUsername->setText(account.getDisplayEmail());
     mPassword->setFocus(Qt::OtherFocusReason);
     mAutomaticLogin->setCheckState(account.isAutomaticLogin ? Qt::Checked : Qt::Unchecked);
+
+    if (account.hasClientSslCert()) {
+        mtls_enable_->setChecked(true);
+        mtls_cert_->setText(account.clientSslCertPath);
+        mtls_key_->setText(account.clientSslKeyPath);
+        mtls_password_->setText(account.clientSslCertPassword);
+        updateMtlsKeyRow();
+    }
 }
 
 void LoginDialog::doLogin()
@@ -138,6 +276,10 @@ void LoginDialog::doLogin()
         return;
     }
     saveUsedServerAddresses(url_.toString());
+
+    // Present the client certificate (if any) so the login request can reach
+    // an mTLS-protected server. It is persisted with the account on success.
+    applyMtlsForLogin(url_);
 
     mStatusText->setText(tr("Logging in..."));
 
@@ -179,6 +321,10 @@ void LoginDialog::disableInputs()
     mSubmitBtn->setEnabled(false);
     mComputerName->setEnabled(false);
     mSSOBtn->setEnabled(false);
+    mtls_enable_->setEnabled(false);
+    mtls_cert_row_->setEnabled(false);
+    mtls_key_row_->setEnabled(false);
+    mtls_password_->setEnabled(false);
 }
 
 void LoginDialog::enableInputs()
@@ -189,6 +335,10 @@ void LoginDialog::enableInputs()
     mSubmitBtn->setEnabled(true);
     mComputerName->setEnabled(true);
     mSSOBtn->setEnabled(true);
+    mtls_enable_->setEnabled(true);
+    mtls_cert_row_->setEnabled(true);
+    mtls_key_row_->setEnabled(true);
+    mtls_password_->setEnabled(true);
 }
 
 void LoginDialog::onNetworkError(const QNetworkReply::NetworkError& error, const QString& error_string)
@@ -362,7 +512,7 @@ void LoginDialog::showWarning(const QString& msg)
     seafApplet->warningBox(msg, this);
 }
 
-#ifdef HAVE_SHIBBOLETH_SUPPORT
+#ifdef HAVE_CLIENT_SSO_SUPPORT
 
 bool LoginDialog::getShibLoginUrl(const QString& last_shib_url, QUrl *url_out)
 {
@@ -436,6 +586,9 @@ void LoginDialog::loginWithShib()
     seafApplet->settingsManager()->setLastShibUrl(url.toString());
     sso_server_ = url;
 
+    // Present the client certificate (if any) for the SSO/IdP requests.
+    applyMtlsForLogin(sso_server_);
+
     ServerInfoRequest *request = new ServerInfoRequest(sso_server_);
     connect(request, SIGNAL(success(const ServerInfo&)),
             this, SLOT(serverInfoSuccess(const ServerInfo&)));
@@ -447,10 +600,16 @@ void LoginDialog::loginWithShib()
 void LoginDialog::serverInfoSuccess(const ServerInfo& info)
 {
     if (!info.clientSSOViaLocalBrowser) {
+#ifdef HAVE_SHIBBOLETH_SUPPORT
         ShibLoginDialog shib_dialog(sso_server_, mComputerName->text(), this);
         if (shib_dialog.exec() == QDialog::Accepted) {
             accept();
         }
+#else
+        showWarning(tr("This server requires in-app SSO login, which is not "
+                       "available in this build. Ask your admin to enable "
+                       "browser-based client SSO."));
+#endif
         return;
     }
 
@@ -546,4 +705,4 @@ void LoginDialog::clientSSOStatusFailed(const ApiError& error)
     client_sso_timer_.stop();
 }
 
-#endif // HAVE_SHIBBOLETH_SUPPORT
+#endif // HAVE_CLIENT_SSO_SUPPORT
